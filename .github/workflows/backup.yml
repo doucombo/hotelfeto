@@ -1,0 +1,164 @@
+##############################################################################
+# Sauvegarde automatique quotidienne — LE FETO HOTEL
+#
+# Ce workflow tourne chaque nuit à 02h00 UTC (heure de Dakar, UTC+0).
+# Il appelle l'endpoint GET /api/admin/export/sql de l'app déployée,
+# pousse le dump SQL dans le repo privé hotelfeto/backups, applique
+# une rétention de 30 jours et crée une archive mensuelle le 1er du mois.
+#
+# Secrets requis dans ce repo GitHub :
+#   BACKUP_API_URL       — URL de base de l'app en production
+#                          ex : https://factureshotelfeto.com
+#   BACKUP_API_TOKEN     — valeur du secret BACKUP_API_TOKEN configuré
+#                          dans l'app Replit (doit correspondre exactement)
+#   BACKUP_REPO_TOKEN    — token GitHub avec accès en écriture sur
+#                          hotelfeto/backups (scope : repo)
+#   BACKUP_ALERT_EMAIL   — adresse email destinataire pour les alertes
+#   BACKUP_SMTP_SERVER   — serveur SMTP (ex : smtp.gmail.com)
+#   BACKUP_SMTP_PORT     — port SMTP (ex : 587)
+#   BACKUP_SMTP_USERNAME — identifiant SMTP (ex : adresse Gmail)
+#   BACKUP_SMTP_PASSWORD — mot de passe SMTP ou app password Gmail
+##############################################################################
+
+name: Backup quotidien
+
+on:
+  schedule:
+    # 02h00 UTC = 02h00 heure de Dakar (UTC+0)
+    - cron: "0 2 * * *"
+  # Permet de déclencher manuellement depuis l'onglet Actions
+  workflow_dispatch:
+
+jobs:
+  backup:
+    name: Dump SQL → hotelfeto/backups
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      # ── 1. Télécharger le dump SQL depuis l'app déployée ──────────────────
+      - name: Télécharger le dump SQL
+        id: download
+        run: |
+          DATE=$(date -u +%Y-%m-%d)
+          FILENAME="feto-backup-${DATE}.sql"
+          echo "date=${DATE}"        >> "$GITHUB_OUTPUT"
+          echo "filename=${FILENAME}" >> "$GITHUB_OUTPUT"
+
+          HTTP_STATUS=$(curl --silent --show-error --fail-with-body \
+            --max-time 120 \
+            -H "X-Backup-Token: ${{ secrets.BACKUP_API_TOKEN }}" \
+            -o "${FILENAME}" \
+            -w "%{http_code}" \
+            "${{ secrets.BACKUP_API_URL }}/api/admin/export/sql")
+
+          echo "HTTP status: ${HTTP_STATUS}"
+          if [ "${HTTP_STATUS}" != "200" ]; then
+            echo "::error::L'export SQL a échoué avec le code HTTP ${HTTP_STATUS}"
+            cat "${FILENAME}" || true
+            exit 1
+          fi
+
+          SIZE=$(wc -c < "${FILENAME}")
+          echo "Taille du dump : ${SIZE} octets"
+          if [ "${SIZE}" -lt 100 ]; then
+            echo "::error::Le fichier dump est trop petit (${SIZE} octets) — export probablement vide ou corrompu"
+            exit 1
+          fi
+
+      # ── 2. Checkout du repo de sauvegardes ────────────────────────────────
+      - name: Checkout hotelfeto/backups
+        uses: actions/checkout@v4
+        with:
+          repository: hotelfeto/backups
+          token: ${{ secrets.BACKUP_REPO_TOKEN }}
+          path: backups-repo
+
+      # ── 3. Copier le dump et gérer les archives ───────────────────────────
+      - name: Organiser les fichiers de sauvegarde
+        run: |
+          DATE="${{ steps.download.outputs.date }}"
+          FILENAME="${{ steps.download.outputs.filename }}"
+          DAY_OF_MONTH=$(date -u +%d)
+          YEAR_MONTH=$(date -u +%Y-%m)
+          TODAY_EPOCH=$(date -u -d "${DATE}" +%s)
+
+          cd backups-repo
+
+          # Créer les dossiers si nécessaires
+          mkdir -p daily monthly
+
+          # Copier le dump dans daily/
+          cp "../${FILENAME}" "daily/${FILENAME}"
+
+          # Si c'est le 1er du mois → archive mensuelle (conservée 12 mois)
+          if [ "${DAY_OF_MONTH}" = "01" ]; then
+            MONTHLY_FILE="monthly/feto-backup-${YEAR_MONTH}.sql"
+            cp "../${FILENAME}" "${MONTHLY_FILE}"
+            echo "Archive mensuelle créée : ${MONTHLY_FILE}"
+          fi
+
+          # ── Rétention daily : supprimer les fichiers de plus de 30 jours ──
+          # On parse la date depuis le nom de fichier (feto-backup-YYYY-MM-DD.sql)
+          # car git checkout réinitialise les timestamps, rendant -mtime inutilisable.
+          CUTOFF_DAILY=$(( TODAY_EPOCH - 30 * 86400 ))
+          for f in daily/feto-backup-????-??-??.sql; do
+            [ -f "$f" ] || continue
+            # Extraire YYYY-MM-DD depuis le nom
+            BASENAME=$(basename "$f" .sql)
+            FILE_DATE="${BASENAME#feto-backup-}"
+            FILE_EPOCH=$(date -u -d "${FILE_DATE}" +%s 2>/dev/null) || continue
+            if [ "${FILE_EPOCH}" -lt "${CUTOFF_DAILY}" ]; then
+              echo "Suppression (>30 jours) : $f"
+              rm "$f"
+            fi
+          done
+
+          # ── Rétention monthly : supprimer les archives de plus de 12 mois ──
+          CUTOFF_MONTHLY=$(( TODAY_EPOCH - 366 * 86400 ))
+          for f in monthly/feto-backup-????-??.sql; do
+            [ -f "$f" ] || continue
+            BASENAME=$(basename "$f" .sql)
+            # Convertir YYYY-MM en date du 1er du mois
+            FILE_DATE="${BASENAME#feto-backup-}-01"
+            FILE_EPOCH=$(date -u -d "${FILE_DATE}" +%s 2>/dev/null) || continue
+            if [ "${FILE_EPOCH}" -lt "${CUTOFF_MONTHLY}" ]; then
+              echo "Suppression (>12 mois) : $f"
+              rm "$f"
+            fi
+          done
+
+      # ── 4. Commit et push dans hotelfeto/backups ──────────────────────────
+      - name: Commit et push
+        run: |
+          cd backups-repo
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --staged --quiet; then
+            echo "Rien à committer (backup identique au précédent)."
+          else
+            git commit -m "backup: ${{ steps.download.outputs.date }}"
+            git push
+          fi
+
+      # ── 5. Alerte email en cas d'échec ────────────────────────────────────
+      - name: Alerte email en cas d'échec
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.BACKUP_SMTP_SERVER }}
+          server_port: ${{ secrets.BACKUP_SMTP_PORT }}
+          username: ${{ secrets.BACKUP_SMTP_USERNAME }}
+          password: ${{ secrets.BACKUP_SMTP_PASSWORD }}
+          subject: "⚠️ Échec sauvegarde LE FETO HOTEL — ${{ steps.download.outputs.date || 'date inconnue' }}"
+          to: ${{ secrets.BACKUP_ALERT_EMAIL }}
+          from: "Backup LE FETO HOTEL <${{ secrets.BACKUP_SMTP_USERNAME }}>"
+          body: |
+            La sauvegarde automatique quotidienne a échoué.
+
+            Date      : ${{ steps.download.outputs.date || 'inconnue' }}
+            Workflow  : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            Veuillez vérifier les logs du workflow pour identifier la cause
+            et déclencher une sauvegarde manuelle si nécessaire.
