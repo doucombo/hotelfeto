@@ -70,7 +70,7 @@ jobs:
       - name: Checkout hotelfeto/backups
         uses: actions/checkout@v4
         with:
-          repository: hotelfeto/backups
+          repository: hotel-feto/backups
           token: ${{ secrets.BACKUP_REPO_TOKEN }}
           path: backups-repo
 
