@@ -3,16 +3,16 @@
 #
 # Ce workflow tourne chaque nuit à 02h00 UTC (heure de Dakar, UTC+0).
 # Il appelle l'endpoint GET /api/admin/export/sql de l'app déployée,
-# pousse le dump SQL dans le repo privé hotelfeto/backups, applique
+# pousse le dump SQL dans le repo privé hotel-feto/backups, applique
 # une rétention de 30 jours et crée une archive mensuelle le 1er du mois.
 #
 # Secrets requis dans ce repo GitHub :
 #   BACKUP_API_URL       — URL de base de l'app en production
-#                          ex : https://factureshotelfeto.com
+#                          ex : https://invoice-generator-pro-cmbodj.replit.app
 #   BACKUP_API_TOKEN     — valeur du secret BACKUP_API_TOKEN configuré
 #                          dans l'app Replit (doit correspondre exactement)
 #   BACKUP_REPO_TOKEN    — token GitHub avec accès en écriture sur
-#                          hotelfeto/backups (scope : repo)
+#                          hotel-feto/backups (scope : repo)
 #   BACKUP_ALERT_EMAIL   — adresse email destinataire pour les alertes
 #   BACKUP_SMTP_SERVER   — serveur SMTP (ex : smtp.gmail.com)
 #   BACKUP_SMTP_PORT     — port SMTP (ex : 587)
@@ -28,22 +28,39 @@ on:
     - cron: "0 2 * * *"
   # Permet de déclencher manuellement depuis l'onglet Actions
   workflow_dispatch:
+    inputs:
+      test_alert:
+        description: "Provoquer un échec contrôlé pour tester l'email d'alerte"
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   backup:
-    name: Dump SQL → hotelfeto/backups
+    name: Dump SQL → hotel-feto/backups
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
     steps:
-      # ── 1. Télécharger le dump SQL depuis l'app déployée ──────────────────
-      - name: Télécharger le dump SQL
-        id: download
+      - name: Préparer les métadonnées
+        id: metadata
         run: |
           DATE=$(date -u +%Y-%m-%d)
           FILENAME="feto-backup-${DATE}.sql"
-          echo "date=${DATE}"        >> "$GITHUB_OUTPUT"
+          echo "date=${DATE}"         >> "$GITHUB_OUTPUT"
           echo "filename=${FILENAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Provoquer l'échec contrôlé
+        if: ${{ inputs.test_alert == true }}
+        run: |
+          echo "::error::Échec contrôlé demandé pour vérifier l'alerte de sauvegarde"
+          exit 1
+
+      # ── 1. Télécharger le dump SQL depuis l'app déployée ──────────────────
+      - name: Télécharger le dump SQL
+        run: |
+          DATE="${{ steps.metadata.outputs.date }}"
+          FILENAME="${{ steps.metadata.outputs.filename }}"
 
           HTTP_STATUS=$(curl --silent --show-error --fail-with-body \
             --max-time 120 \
@@ -55,7 +72,7 @@ jobs:
           echo "HTTP status: ${HTTP_STATUS}"
           if [ "${HTTP_STATUS}" != "200" ]; then
             echo "::error::L'export SQL a échoué avec le code HTTP ${HTTP_STATUS}"
-            cat "${FILENAME}" || true
+             rm -f "${FILENAME}"
             exit 1
           fi
 
@@ -67,7 +84,7 @@ jobs:
           fi
 
       # ── 2. Checkout du repo de sauvegardes ────────────────────────────────
-      - name: Checkout hotelfeto/backups
+      - name: Checkout hotel-feto/backups
         uses: actions/checkout@v4
         with:
           repository: hotel-feto/backups
@@ -77,8 +94,8 @@ jobs:
       # ── 3. Copier le dump et gérer les archives ───────────────────────────
       - name: Organiser les fichiers de sauvegarde
         run: |
-          DATE="${{ steps.download.outputs.date }}"
-          FILENAME="${{ steps.download.outputs.filename }}"
+          DATE="${{ steps.metadata.outputs.date }}"
+          FILENAME="${{ steps.metadata.outputs.filename }}"
           DAY_OF_MONTH=$(date -u +%d)
           YEAR_MONTH=$(date -u +%Y-%m)
           TODAY_EPOCH=$(date -u -d "${DATE}" +%s)
@@ -138,26 +155,33 @@ jobs:
           if git diff --staged --quiet; then
             echo "Rien à committer (backup identique au précédent)."
           else
-            git commit -m "backup: ${{ steps.download.outputs.date }}"
+            git commit -m "backup: ${{ steps.metadata.outputs.date }}"
             git push
           fi
 
-      # ── 5. Alerte email en cas d'échec ────────────────────────────────────
+  alert:
+    name: Envoyer l'alerte d'échec
+    needs: backup
+    if: ${{ always() && needs.backup.result == 'failure' }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      # Ce job reste indépendant : un problème SMTP ne remplace pas l'échec
+      # initial du job "backup", qui demeure la cause de l'échec du workflow.
       - name: Alerte email en cas d'échec
-        if: failure()
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: ${{ secrets.BACKUP_SMTP_SERVER }}
           server_port: ${{ secrets.BACKUP_SMTP_PORT }}
           username: ${{ secrets.BACKUP_SMTP_USERNAME }}
           password: ${{ secrets.BACKUP_SMTP_PASSWORD }}
-          subject: "⚠️ Échec sauvegarde LE FETO HOTEL — ${{ steps.download.outputs.date || 'date inconnue' }}"
+          subject: "⚠️ Échec sauvegarde LE FETO HOTEL — ${{ github.run_id }}"
           to: ${{ secrets.BACKUP_ALERT_EMAIL }}
           from: "Backup LE FETO HOTEL <${{ secrets.BACKUP_SMTP_USERNAME }}>"
           body: |
             La sauvegarde automatique quotidienne a échoué.
 
-            Date      : ${{ steps.download.outputs.date || 'inconnue' }}
+            Exécution : ${{ github.run_id }}
             Workflow  : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
             Veuillez vérifier les logs du workflow pour identifier la cause
